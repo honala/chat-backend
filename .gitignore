@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+uvicorn.log
+chat_data.db
+*.db
