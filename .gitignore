@@ -3,3 +3,4 @@ __pycache__/
 uvicorn.log
 chat_data.db
 *.db
+free_llm_config.json
