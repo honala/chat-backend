@@ -6,11 +6,17 @@
 #   3. 后端代理转 base64 — resolve_file_urls() 把磁盘文件读出转 base64 再发 LLM，
 #      等于绕一圈没绕，方案自我否定
 # 结论：单用户场景 base64 够用，不要再次尝试 URL 上传方案。
+import ast
+import html as _htmlmod
 import json
+import math
+import operator
 import os
-import uuid
+import re
 import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -1083,6 +1089,422 @@ async def gemini_llm(request: Request):
 
 DASHSCOPE_IMAGE_URL = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
 DASHSCOPE_VIDEO_URL = "https://dashscope.aliyuncs.com/api/v1/services/aigc/video-generation/video-synthesis"
+
+
+def _html_to_text(raw: str) -> str:
+    """Very small HTML -> plain text extractor (no external deps)."""
+    raw = re.sub(r"(?is)<(script|style|noscript|svg|head)[^>]*>.*?</\1>", " ", raw)
+    raw = re.sub(r"(?is)<br\s*/?>", "\n", raw)
+    raw = re.sub(r"(?is)</(p|div|li|h[1-6]|tr|section|article|ul|ol|table)>", "\n", raw)
+    text = re.sub(r"(?is)<[^>]+>", " ", raw)
+    text = _htmlmod.unescape(text)
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r"\n[ \t]*", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+@router.post("/read-url")
+async def read_url_endpoint(request: Request):
+    """Fetch a web page and return its readable text (server-side, avoids CORS)."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid_json"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "invalid_payload"}, status_code=400)
+    url = str(body.get("url") or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return JSONResponse({"error": "invalid_url"}, status_code=400)
+    max_chars = max(500, min(int(body.get("max_chars") or 8000), 40000))
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (compatible; HonalaChat/1.0; +https://honala.xyz)",
+        "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
+    }, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            raw = resp.read(2_000_000).decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        return JSONResponse({"error": "fetch_failed", "status": exc.code, "detail": str(exc.reason)}, status_code=502)
+    except Exception as exc:
+        return JSONResponse({"error": "fetch_failed", "detail": str(exc)[:200]}, status_code=502)
+    if "html" in ctype or "<html" in raw[:500].lower():
+        m = re.search(r"(?is)<title[^>]*>(.*?)</title>", raw)
+        title = re.sub(r"\s+", " ", m.group(1)).strip() if m else ""
+        text = _html_to_text(raw)
+    else:
+        title = ""
+        text = raw
+    return JSONResponse({"url": url, "title": title, "text": text[:max_chars], "truncated": len(text) > max_chars})
+
+
+@router.post("/weather")
+async def weather_endpoint(request: Request):
+    """Current + 3-day forecast via Open-Meteo (free, no API key)."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid_json"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "invalid_payload"}, status_code=400)
+    loc = str(body.get("location") or "").strip()[:80]
+    if not loc:
+        return JSONResponse({"error": "missing_location"}, status_code=400)
+    try:
+        geo_url = ("https://geocoding-api.open-meteo.com/v1/search?name="
+                   + urllib.parse.quote(loc) + "&count=1&language=zh&format=json")
+        with urllib.request.urlopen(geo_url, timeout=15) as r:
+            geo = json.loads(r.read().decode("utf-8"))
+        hits = geo.get("results") or []
+        if not hits:
+            return JSONResponse({"error": "location_not_found", "location": loc}, status_code=404)
+        g = hits[0]
+        fc_url = ("https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s"
+                  "&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m"
+                  "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+                  "&timezone=auto&forecast_days=3" % (g["latitude"], g["longitude"]))
+        with urllib.request.urlopen(fc_url, timeout=15) as r:
+            fc = json.loads(r.read().decode("utf-8"))
+    except Exception as exc:
+        return JSONResponse({"error": "weather_failed", "detail": str(exc)[:200]}, status_code=502)
+    name = " ".join(x for x in [g.get("name"), g.get("admin1"), g.get("country")] if x)
+    return JSONResponse({
+        "location": name,
+        "current": fc.get("current"),
+        "current_units": fc.get("current_units"),
+        "daily": fc.get("daily"),
+        "daily_units": fc.get("daily_units"),
+    })
+
+
+
+# ── Tool registry (server-side execution) ─────
+def _t_parse_args(a):
+    if isinstance(a, dict):
+        return a
+    if not a:
+        return {}
+    try:
+        v = json.loads(a)
+        return v if isinstance(v, dict) else {}
+    except Exception:
+        return {}
+
+
+def _t_read_url(args):
+    url = str(args.get("url") or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return "（无效链接）"
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (compatible; HonalaChat/1.0)",
+        "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
+    }, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            raw = resp.read(2_000_000).decode("utf-8", errors="replace")
+    except Exception as exc:
+        return "（网页读取失败：%s）" % str(exc)[:100]
+    if "html" in ctype or "<html" in raw[:500].lower():
+        m = re.search(r"(?is)<title[^>]*>(.*?)</title>", raw)
+        title = re.sub(r"\s+", " ", m.group(1)).strip() if m else ""
+        text = _html_to_text(raw)
+    else:
+        title = ""
+        text = raw
+    return "[网页: %s]\n%s" % (title or url, text[:8000])
+
+
+def _t_weather(args):
+    loc = str(args.get("location") or "").strip()[:80]
+    if not loc:
+        return "（未提供地点）"
+    try:
+        geo_url = ("https://geocoding-api.open-meteo.com/v1/search?name="
+                   + urllib.parse.quote(loc) + "&count=1&language=zh&format=json")
+        with urllib.request.urlopen(geo_url, timeout=15) as r:
+            geo = json.loads(r.read().decode("utf-8"))
+        hits = geo.get("results") or []
+        if not hits:
+            return "（未找到地点：%s）" % loc
+        g = hits[0]
+        fc_url = ("https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s"
+                  "&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m"
+                  "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+                  "&timezone=auto&forecast_days=3" % (g["latitude"], g["longitude"]))
+        with urllib.request.urlopen(fc_url, timeout=15) as r:
+            fc = json.loads(r.read().decode("utf-8"))
+    except Exception as exc:
+        return "（天气查询失败：%s）" % str(exc)[:100]
+    name = " ".join(x for x in [g.get("name"), g.get("admin1"), g.get("country")] if x)
+    c = fc.get("current") or {}
+    u = fc.get("current_units") or {}
+    d = fc.get("daily") or {}
+    out = ("[天气: %s]\n当前：%s%s（体感 %s%s），湿度 %s%s，风速 %s%s"
+           % (name, c.get("temperature_2m"), u.get("temperature_2m", ""),
+              c.get("apparent_temperature"), u.get("apparent_temperature", ""),
+              c.get("relative_humidity_2m"), u.get("relative_humidity_2m", ""),
+              c.get("wind_speed_10m"), u.get("wind_speed_10m", "")))
+    if d.get("time"):
+        out += "\n未来几天："
+        for i in range(len(d["time"])):
+            out += "\n%s %s~%s℃ 降水概率%s%%" % (
+                d["time"][i], d["temperature_2m_min"][i], d["temperature_2m_max"][i],
+                (d.get("precipitation_probability_max") or ["-"])[i])
+    return out
+
+
+def _t_get_time(args):
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone(timedelta(hours=8)))
+    return "当前时间：%s（Asia/Shanghai）" % now.strftime("%Y-%m-%d %H:%M")
+
+
+_CALC_OPS = {
+    ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+    ast.Div: operator.truediv, ast.Pow: operator.pow, ast.Mod: operator.mod,
+    ast.FloorDiv: operator.floordiv, ast.USub: operator.neg, ast.UAdd: operator.pos,
+}
+_CALC_FUNCS = {"sqrt": math.sqrt, "abs": abs, "round": round, "pow": pow}
+_CALC_CONSTS = {"pi": math.pi, "e": math.e}
+# 把“书写体”数学符号归一化成 Python 认的写法
+_CALC_SYMBOLS = {
+    "\u00d7": "*", "\u00b7": "*", "\u2715": "*", "\u2716": "*", "\uff0a": "*",   # x · X X
+    "\u00f7": "/", "\uff0f": "/",                                                      # /
+    "\u2212": "-", "\u2013": "-", "\u2014": "-", "\uff0d": "-", "\uff0b": "+",    # - - - - +
+    "\uff08": "(", "\uff09": ")",                                                      # ( )
+    "\uff05": "%",                                                                       # %
+    "^": "**",
+    "\u00b2": "**2", "\u00b3": "**3",                                                  # ^2 ^3
+    "\u03c0": "pi",                                                                      # pi
+    "\u221a": "sqrt",                                                                    # sqrt
+    "\uff0c": ",",                                                                       # ,
+}
+
+
+def _calc_norm(ex: str) -> str:
+    ex = "".join(_CALC_SYMBOLS.get(ch, ch) for ch in ex)
+    # √9 -> sqrt(9)（√ 后跟数字且没括号时自动补括号）
+    ex = re.sub(r"\bsqrt\s*([0-9]+(?:\.[0-9]+)?)", r"sqrt(\1)", ex)
+    return ex
+
+
+def _calc_eval(node):
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, (int, float)):
+            return node.value
+        raise ValueError("bad const")
+    if isinstance(node, ast.BinOp):
+        op = _CALC_OPS.get(type(node.op))
+        if op is None:
+            raise ValueError("bad op")
+        return op(_calc_eval(node.left), _calc_eval(node.right))
+    if isinstance(node, ast.UnaryOp):
+        op = _CALC_OPS.get(type(node.op))
+        if op is None:
+            raise ValueError("bad op")
+        return op(_calc_eval(node.operand))
+    if isinstance(node, ast.Name):
+        if node.id in _CALC_CONSTS:
+            return _CALC_CONSTS[node.id]
+        raise ValueError("bad name")
+    if isinstance(node, ast.Call):
+        if isinstance(node.func, ast.Name) and node.func.id in _CALC_FUNCS and not node.keywords:
+            return _CALC_FUNCS[node.func.id](*[_calc_eval(a) for a in node.args])
+        raise ValueError("bad call")
+    raise ValueError("bad node")
+
+
+def _t_calculator(args):
+    ex = str(args.get("expression") or "").strip()
+    try:
+        tree = ast.parse(_calc_norm(ex), mode="eval")
+        val = _calc_eval(tree.body)
+        if isinstance(val, (int, float)) and val == val and abs(val) != float("inf"):
+            return "%s = %s" % (ex, val)
+    except Exception:
+        pass
+    return "（计算失败）"
+
+
+def _t_web_search(args):
+    q = str(args.get("query") or "").strip()
+    if not q:
+        return "（搜索关键词为空，未执行）"
+    context, error, items = call_exa_search(q)
+    if not context and not error:
+        context, error, items = call_brave_context(q)
+    if error or not context:
+        return "（搜索无结果）"
+    return context
+
+
+def _search_cards(args):
+    try:
+        q = str(args.get("query") or "").strip()
+        context, error, items = call_exa_search(q)
+        if not context and not error:
+            context, error, items = call_brave_context(q)
+        return [{"title": i.get("title", ""), "url": i.get("url", "")} for i in (items or [])[:6]]
+    except Exception:
+        return []
+
+
+_TOOL_SCHEMA_SEARCH = {"type": "function", "function": {"name": "web_search", "description": "搜索实时网络信息。当需要最新新闻、事实核查、实时数据，或用户问题的答案超出你知识截止日期时使用。", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "搜索查询词，使用用户消息的语言"}}, "required": ["query"]}}}
+_TOOL_SCHEMA_READ = {"type": "function", "function": {"name": "read_url", "description": "抓取指定网页的正文全文。当搜索结果只有摘要、需要网页正文或更多细节时使用。", "parameters": {"type": "object", "properties": {"url": {"type": "string", "description": "要读取的完整网页地址（http/https）"}}, "required": ["url"]}}}
+_TOOL_SCHEMA_WEATHER = {"type": "function", "function": {"name": "weather", "description": "查询某地当前天气与未来三天预报（结构化数据，比联网搜索更准）。", "parameters": {"type": "object", "properties": {"location": {"type": "string", "description": "城市或地点名称，如 北京、Shanghai"}}, "required": ["location"]}}}
+_TOOL_SCHEMA_TIME = {"type": "function", "function": {"name": "get_time", "description": "获取当前日期与时间。", "parameters": {"type": "object", "properties": {}}}}
+_TOOL_SCHEMA_CALC = {"type": "function", "function": {"name": "calculator", "description": "进行精确数学计算。支持 + - * / ( ) 及幂（^ 或 **）、平方根 sqrt（或 √）、常量 pi/e；也接受 × ÷ − 等书写符号。", "parameters": {"type": "object", "properties": {"expression": {"type": "string", "description": "数学表达式，如 (12.5*3+7)/2"}}, "required": ["expression"]}}}
+
+TOOL_SCHEMAS = [_TOOL_SCHEMA_SEARCH, _TOOL_SCHEMA_READ, _TOOL_SCHEMA_WEATHER, _TOOL_SCHEMA_TIME, _TOOL_SCHEMA_CALC]
+_TOOL_FUNCS = {"web_search": _t_web_search, "read_url": _t_read_url, "weather": _t_weather, "get_time": _t_get_time, "calculator": _t_calculator}
+
+
+def _tool_summary(name, args):
+    if name == "web_search":
+        return "联网搜索：" + str(args.get("query", ""))
+    if name == "read_url":
+        return "读取网页：" + str(args.get("url", ""))
+    if name == "weather":
+        return "天气：" + str(args.get("location", ""))
+    if name == "get_time":
+        return "获取当前时间"
+    if name == "calculator":
+        return "计算：" + str(args.get("expression", ""))
+    return name
+
+
+def _exec_tool(name, args):
+    fn = _TOOL_FUNCS.get(name)
+    if not fn:
+        return "（工具不可用：%s）" % name
+    try:
+        return fn(args)
+    except Exception as exc:
+        return "（工具执行出错：%s）" % str(exc)[:120]
+
+
+def _resolve_agent_backend(provider_id, model):
+    if provider_id:
+        provs = list_providers()
+        p = next((x for x in provs if x["id"] == provider_id), None)
+        if not p:
+            return None, None, False, True
+        base = p["base_url"].strip().rstrip("/")
+        return base + "/chat/completions", p["api_key"], False, True
+    api_url, key, is_qwen = _get_backend(model)
+    return api_url, key, is_qwen, False
+
+
+def _agent_model_call(url, key, model, messages, tools, is_qwen, external, temperature, top_p):
+    body = {"model": model, "messages": messages, "stream": False,
+            "temperature": temperature, "top_p": top_p}
+    if tools:
+        body["tools"] = tools
+        body["tool_choice"] = "auto"
+    if not external:
+        if is_qwen:
+            body["enable_thinking"] = False
+        else:
+            body["thinking"] = {"type": "disabled"}
+    req = urllib.request.Request(
+        url, data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "application/json",
+                 "Authorization": "Bearer %s" % key}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError("HTTP %s: %s" % (exc.code, body[:400]))
+    choices = data.get("choices") or []
+    if not choices:
+        return None
+    return choices[0].get("message") or None
+
+
+def _agent_events(messages, model, provider_id, max_steps, temperature, top_p):
+    url, key, is_qwen, external = _resolve_agent_backend(provider_id, model)
+    if not key:
+        yield {"type": "error", "message": "api_key_not_configured"}
+        return
+    msgs = [dict(m) for m in messages]
+    answered = False
+    try:
+        for step in range(max(1, max_steps)):
+            yield {"type": "status", "phase": "deciding", "step": step}
+            try:
+                msg = _agent_model_call(url, key, model, msgs, TOOL_SCHEMAS, is_qwen, external, temperature, top_p)
+            except Exception as exc:
+                yield {"type": "error", "message": "upstream_error: %s" % str(exc)[:160]}
+                return
+            if msg is None:
+                yield {"type": "error", "message": "upstream_empty"}
+                return
+            tcs = msg.get("tool_calls") or []
+            if not tcs:
+                text = msg.get("content") or ""
+                for i in range(0, len(text), 24):
+                    yield {"type": "answer_delta", "text": text[i:i + 24]}
+                answered = True
+                break
+            asst = {"role": "assistant", "content": "", "tool_calls": tcs}
+            rc = msg.get("reasoning_content")
+            if rc:
+                asst["reasoning_content"] = rc
+            msgs.append(asst)
+            for tc in tcs:
+                fn = tc.get("function") or {}
+                name = fn.get("name") or ""
+                args = _t_parse_args(fn.get("arguments"))
+                yield {"type": "tool_call", "id": tc.get("id"), "name": name,
+                       "summary": _tool_summary(name, args)}
+                content = _exec_tool(name, args)
+                ev = {"type": "tool_result", "id": tc.get("id"), "name": name,
+                      "ok": not str(content).startswith("（"), "content": str(content)[:2000]}
+                if name == "web_search":
+                    ev["cards"] = _search_cards(args)
+                yield ev
+                msgs.append({"role": "tool", "tool_call_id": tc.get("id"), "content": content})
+        if not answered:
+            yield {"type": "status", "phase": "answering"}
+            try:
+                msg = _agent_model_call(url, key, model, msgs, None, is_qwen, external, temperature, top_p)
+                text = (msg or {}).get("content") or ""
+            except Exception:
+                text = ""
+            for i in range(0, len(text), 24):
+                yield {"type": "answer_delta", "text": text[i:i + 24]}
+    except Exception as exc:
+        yield {"type": "error", "message": str(exc)[:200]}
+        return
+    yield {"type": "done", "model": model}
+
+
+@router.post("/agent")
+async def agent_endpoint(request: Request):
+    """Server-side agent loop: decides, executes tools, streams events as NDJSON."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid_json"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "invalid_payload"}, status_code=400)
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return JSONResponse({"error": "invalid_messages"}, status_code=400)
+    model = str(body.get("model") or "deepseek-flash")
+    provider_id = str(body.get("provider_id") or "") or None
+    max_steps = int(body.get("max_steps") or 4)
+    temperature = float(body.get("temperature", 0.7))
+    top_p = float(body.get("top_p", 0.9))
+
+    def generate():
+        for ev in _agent_events(messages, model, provider_id, max_steps, temperature, top_p):
+            yield (json.dumps(ev, ensure_ascii=False) + "\n").encode("utf-8")
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
 
 
 @router.post("/image-gen")
