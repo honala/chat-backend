@@ -1019,7 +1019,8 @@ def _t_generate_video(args):
 
 
 _TOOL_SCHEMA_VIDEO = {"type": "function", "function": {"name": "generate_video", "description": "根据文字描述生成短视频。当用户要求生成视频、动画、动态效果时使用。", "parameters": {"type": "object", "properties": {"prompt": {"type": "string", "description": "视频的详细描述"}, "duration": {"type": "integer", "description": "时长（秒，默认5）"}}, "required": ["prompt"]}}}
-TOOL_SCHEMAS = [_TOOL_SCHEMA_SEARCH, _TOOL_SCHEMA_READ, _TOOL_SCHEMA_WEATHER, _TOOL_SCHEMA_TIME, _TOOL_SCHEMA_CALC, _TOOL_SCHEMA_IMAGE, _TOOL_SCHEMA_VIDEO]
+_TOOL_SCHEMA_ASK = {"type": "function", "function": {"name": "ask_user", "description": "当信息不足、需要用户在多个选项间做选择、或需要用户确认时，向用户提问以澄清。只在确实必要时使用；能用常识合理推断就不要问。", "parameters": {"type": "object", "properties": {"question": {"type": "string", "description": "要问用户的问题"}, "options": {"type": "array", "items": {"type": "string"}, "description": "可选的候选选项（若适用）"}}, "required": ["question"]}}}
+TOOL_SCHEMAS = [_TOOL_SCHEMA_SEARCH, _TOOL_SCHEMA_READ, _TOOL_SCHEMA_WEATHER, _TOOL_SCHEMA_TIME, _TOOL_SCHEMA_CALC, _TOOL_SCHEMA_IMAGE, _TOOL_SCHEMA_VIDEO, _TOOL_SCHEMA_ASK]
 _TOOL_FUNCS = {"web_search": _t_web_search, "read_url": _t_read_url, "weather": _t_weather, "get_time": _t_get_time, "calculator": _t_calculator, "generate_image": _t_generate_image, "generate_video": _t_generate_video}
 
 
@@ -1186,6 +1187,26 @@ def _agent_events(messages, model, provider_id, max_steps, temperature, top_p, t
                 gen_ms = int((time.time() - t0) * 1000)
                 break
             calls = [acc[i] for i in sorted(acc.keys())]
+            # ask_user：模型主动提问 → 作为“提问回合”呈现（不落 tool_calls，避免悬挂配对）
+            if any((tc.get("function") or {}).get("name") == "ask_user" for tc in calls):
+                lines = []
+                for tc in calls:
+                    fn = tc.get("function") or {}
+                    if fn.get("name") != "ask_user":
+                        continue
+                    a = _t_parse_args(fn.get("arguments"))
+                    q = str(a.get("question") or "").strip()
+                    opts = a.get("options")
+                    if q:
+                        lines.append(q)
+                    yield {"type": "ask", "id": tc.get("id"), "question": q,
+                           "options": [str(o) for o in opts] if isinstance(opts, list) else []}
+                text = "\n".join(lines) or "（需要你补充一下信息）"
+                for i in range(0, len(text), 24):
+                    yield {"type": "answer_delta", "text": text[i:i + 24]}
+                answered = True
+                gen_ms = int((time.time() - t0) * 1000)
+                break
             asst = {"role": "assistant", "content": "", "tool_calls": calls}
             msgs.append(asst)
             new_msgs.append(asst)
