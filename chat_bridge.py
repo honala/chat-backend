@@ -920,8 +920,38 @@ _TOOL_SCHEMA_WEATHER = {"type": "function", "function": {"name": "weather", "des
 _TOOL_SCHEMA_TIME = {"type": "function", "function": {"name": "get_time", "description": "获取当前日期与时间。", "parameters": {"type": "object", "properties": {}}}}
 _TOOL_SCHEMA_CALC = {"type": "function", "function": {"name": "calculator", "description": "进行精确数学计算。支持 + - * / ( ) 及幂（^ 或 **）、平方根 sqrt（或 √）、常量 pi/e；也接受 × ÷ − 等书写符号。", "parameters": {"type": "object", "properties": {"expression": {"type": "string", "description": "数学表达式，如 (12.5*3+7)/2"}}, "required": ["expression"]}}}
 
-TOOL_SCHEMAS = [_TOOL_SCHEMA_SEARCH, _TOOL_SCHEMA_READ, _TOOL_SCHEMA_WEATHER, _TOOL_SCHEMA_TIME, _TOOL_SCHEMA_CALC]
-_TOOL_FUNCS = {"web_search": _t_web_search, "read_url": _t_read_url, "weather": _t_weather, "get_time": _t_get_time, "calculator": _t_calculator}
+def _t_generate_image(args):
+    prompt = str(args.get("prompt") or "").strip()[:1000]
+    if not prompt:
+        return "（未提供图片描述）"
+    api_key = _get_api_key("dashscope")
+    if not api_key:
+        return "（图片生成未配置 dashscope key）"
+    size = str(args.get("size") or "1024*1024")
+    req_body = {"model": "qwen-image-2.0-pro",
+                "input": {"messages": [{"role": "user", "content": [{"text": prompt}]}]},
+                "parameters": {"size": size}}
+    req = urllib.request.Request(
+        DASHSCOPE_IMAGE_URL, data=json.dumps(req_body, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Authorization": "Bearer %s" % api_key},
+        method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=120) as upstream:
+            data = json.loads(upstream.read().decode("utf-8"))
+    except Exception as exc:
+        return "（图片生成失败：%s）" % str(exc)[:120]
+    try:
+        url = data["output"]["choices"][0]["message"]["content"][0]["image"]
+    except (KeyError, IndexError, TypeError):
+        url = ""
+    if not url:
+        return "（图片生成无返回）"
+    return "[已生成图片] %s" % url
+
+
+_TOOL_SCHEMA_IMAGE = {"type": "function", "function": {"name": "generate_image", "description": "根据文字描述生成图片。当用户要求画图、生成图片、配图时使用。", "parameters": {"type": "object", "properties": {"prompt": {"type": "string", "description": "图片的详细描述"}, "size": {"type": "string", "description": "尺寸如 1024*1024（可选）"}}, "required": ["prompt"]}}}
+TOOL_SCHEMAS = [_TOOL_SCHEMA_SEARCH, _TOOL_SCHEMA_READ, _TOOL_SCHEMA_WEATHER, _TOOL_SCHEMA_TIME, _TOOL_SCHEMA_CALC, _TOOL_SCHEMA_IMAGE]
+_TOOL_FUNCS = {"web_search": _t_web_search, "read_url": _t_read_url, "weather": _t_weather, "get_time": _t_get_time, "calculator": _t_calculator, "generate_image": _t_generate_image}
 
 
 def _tool_summary(name, args):
@@ -935,6 +965,8 @@ def _tool_summary(name, args):
         return "获取当前时间"
     if name == "calculator":
         return "计算：" + str(args.get("expression", ""))
+    if name == "generate_image":
+        return "生成图片：" + str(args.get("prompt", ""))[:40]
     return name
 
 
@@ -1040,7 +1072,7 @@ def _merge_tool_deltas(acc, deltas):
             tc["function"]["arguments"] += fn["arguments"]
 
 
-def _agent_events(messages, model, provider_id, max_steps, temperature, top_p, think=False):
+def _agent_events(messages, model, provider_id, max_steps, temperature, top_p, think=False, agent_id=""):
     url, key, is_qwen, external = _resolve_agent_backend(provider_id, model)
     if not key:
         yield {"type": "error", "message": "api_key_not_configured"}
@@ -1053,6 +1085,10 @@ def _agent_events(messages, model, provider_id, max_steps, temperature, top_p, t
     answered = False
     try:
         for step in range(max(1, max_steps)):
+            if agent_id and _AGENT_STOP.get(agent_id):
+                yield {"type": "done", "model": model, "usage": usage, "gen_ms": gen_ms,
+                       "finish_reason": "stopped", "new_messages": new_msgs}
+                return
             yield {"type": "status", "phase": "deciding", "step": step}
             acc = {}
             t0 = time.time()
@@ -1090,6 +1126,8 @@ def _agent_events(messages, model, provider_id, max_steps, temperature, top_p, t
                        "ok": not str(content).startswith("（"), "content": str(content)[:2000]}
                 if name == "web_search":
                     tev["cards"] = _search_cards(args)
+                if name == "generate_image" and str(content).startswith("[已生成图片] "):
+                    tev["image"] = str(content)[len("[已生成图片] "):].strip()
                 yield tev
                 tmsg = {"role": "tool", "tool_call_id": tc.get("id"), "content": content}
                 msgs.append(tmsg)
@@ -1117,6 +1155,22 @@ def _agent_events(messages, model, provider_id, max_steps, temperature, top_p, t
            "finish_reason": finish_reason, "new_messages": new_msgs}
 
 
+_AGENT_STOP = {}
+
+
+@router.post("/agent/abort")
+async def agent_abort(request: Request):
+    """前端点“停止”时调用，通知服务端终止对应 Agent 循环。"""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    aid = str((body or {}).get("id") or "")
+    if aid:
+        _AGENT_STOP[aid] = True
+    return JSONResponse({"ok": True})
+
+
 @router.post("/agent")
 async def agent_endpoint(request: Request):
     """Server-side agent loop: decides, executes tools, streams events as NDJSON."""
@@ -1135,10 +1189,15 @@ async def agent_endpoint(request: Request):
     temperature = float(body.get("temperature", 0.7))
     top_p = float(body.get("top_p", 0.9))
     think = bool(body.get("think", False))
+    agent_id = request.headers.get("x-agent-id") or ""
 
     def generate():
-        for ev in _agent_events(messages, model, provider_id, max_steps, temperature, top_p, think):
-            yield (json.dumps(ev, ensure_ascii=False) + "\n").encode("utf-8")
+        try:
+            for ev in _agent_events(messages, model, provider_id, max_steps, temperature, top_p, think, agent_id):
+                yield (json.dumps(ev, ensure_ascii=False) + "\n").encode("utf-8")
+        finally:
+            if agent_id:
+                _AGENT_STOP.pop(agent_id, None)
 
     return StreamingResponse(generate(), media_type="application/x-ndjson")
 
