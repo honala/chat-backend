@@ -8,8 +8,10 @@
 # 结论：单用户场景 base64 够用，不要再次尝试 URL 上传方案。
 import ast
 import html as _htmlmod
+import ipaddress
 import json
 import math
+import socket
 import operator
 import os
 import re
@@ -22,7 +24,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
-from fastapi import APIRouter, File, Form, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from utils import utc_iso
@@ -41,7 +43,14 @@ from database import (
 )
 
 
-router = APIRouter()
+def _require_token(x_access_token: str | None = Header(default=None)):
+    """轻量访问口令：设置了 HONALA_ACCESS_TOKEN 后，chat API 必须带 X-Access-Token 头。"""
+    tok = os.environ.get("HONALA_ACCESS_TOKEN", "").strip()
+    if tok and (x_access_token or "").strip() != tok:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+
+router = APIRouter(dependencies=[Depends(_require_token)])
 
 OLLAMA_CHAT_URL = os.environ.get("HONALA_OLLAMA_CHAT_URL", "http://127.0.0.1:11434/api/chat")
 REQUEST_TIMEOUT = max(5, int(os.environ.get("HONALA_CHAT_TIMEOUT_SECONDS", "60")))
@@ -595,7 +604,8 @@ async def api_save_messages(request: Request):
 
 @router.get("/providers")
 async def api_list_providers():
-    return JSONResponse({"providers": list_providers()})
+    provs = [{"id": p.get("id", ""), "name": p.get("name", ""), "base_url": p.get("base_url", "")} for p in list_providers()]
+    return JSONResponse({"providers": provs})
 
 
 @router.post("/providers")
@@ -756,10 +766,30 @@ def _t_parse_args(a):
         return {}
 
 
+def _host_is_public(host: str) -> bool:
+    """只允许解析到公网地址，挡 SSRF（内网/回环/链路本地/保留段）。"""
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return False
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except Exception:
+            return False
+        if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+                or ip.is_multicast or ip.is_unspecified):
+            return False
+    return True
+
+
 def _t_read_url(args):
     url = str(args.get("url") or "").strip()
     if not url.startswith(("http://", "https://")):
         return "（无效链接）"
+    _host = urllib.parse.urlparse(url).hostname or ""
+    if not _host or not _host_is_public(_host):
+        return "（该链接不允许访问）"
     req = urllib.request.Request(url, headers={
         "User-Agent": "Mozilla/5.0 (compatible; HonalaChat/1.0)",
         "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
