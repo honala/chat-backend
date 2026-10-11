@@ -19,6 +19,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from fastapi import APIRouter, File, Form, Request, UploadFile
@@ -44,7 +45,7 @@ router = APIRouter()
 
 OLLAMA_CHAT_URL = os.environ.get("HONALA_OLLAMA_CHAT_URL", "http://127.0.0.1:11434/api/chat")
 REQUEST_TIMEOUT = max(5, int(os.environ.get("HONALA_CHAT_TIMEOUT_SECONDS", "60")))
-SOURCE_LIMIT = 6
+SOURCE_LIMIT = 10
 DEEPSEEK_API_URL = os.environ.get("HONALA_DEEPSEEK_API_URL", "https://api.deepseek.com/v1/chat/completions").strip()
 DASHSCOPE_API_URL = os.environ.get("HONALA_DASHSCOPE_API_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions").strip()
 
@@ -241,7 +242,7 @@ def call_exa_search(query: str) -> tuple[str | None, str | None, list[dict[str, 
     if not api_key:
         return None, None, []
 
-    num_results = max(1, min(10, _get_config_int("exa_num_results", "", 5)))
+    num_results = max(1, min(10, _get_config_int("exa_num_results", "", 8)))
     max_chars = max(500, min(12000, _get_config_int("exa_highlight_max_chars", "", 3200)))
 
     payload = {
@@ -900,18 +901,8 @@ def _t_web_search(args):
         context, error, items = call_brave_context(q)
     if error or not context:
         return "（搜索无结果）"
-    return context
-
-
-def _search_cards(args):
-    try:
-        q = str(args.get("query") or "").strip()
-        context, error, items = call_exa_search(q)
-        if not context and not error:
-            context, error, items = call_brave_context(q)
-        return [{"title": i.get("title", ""), "url": i.get("url", "")} for i in (items or [])[:6]]
-    except Exception:
-        return []
+    cards = [{"title": i.get("title", ""), "url": i.get("url", "")} for i in (items or [])[:12]]
+    return context, {"cards": cards}
 
 
 _TOOL_SCHEMA_SEARCH = {"type": "function", "function": {"name": "web_search", "description": "搜索实时网络信息。当需要最新新闻、事实核查、实时数据，或用户问题的答案超出你知识截止日期时使用。", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "搜索查询词，使用用户消息的语言"}}, "required": ["query"]}}}
@@ -946,7 +937,7 @@ def _t_generate_image(args):
         url = ""
     if not url:
         return "（图片生成无返回）"
-    return "[已生成图片] %s" % url
+    return "[已生成图片] %s" % url, {"image": url}
 
 
 _TOOL_SCHEMA_IMAGE = {"type": "function", "function": {"name": "generate_image", "description": "根据文字描述生成图片。当用户要求画图、生成图片、配图时使用。", "parameters": {"type": "object", "properties": {"prompt": {"type": "string", "description": "图片的详细描述"}, "size": {"type": "string", "description": "尺寸如 1024*1024（可选）"}}, "required": ["prompt"]}}}
@@ -973,11 +964,14 @@ def _tool_summary(name, args):
 def _exec_tool(name, args):
     fn = _TOOL_FUNCS.get(name)
     if not fn:
-        return "（工具不可用：%s）" % name
+        return "（工具不可用：%s）" % name, None
     try:
-        return fn(args)
+        r = fn(args)
     except Exception as exc:
-        return "（工具执行出错：%s）" % str(exc)[:120]
+        return "（工具执行出错：%s）" % str(exc)[:120], None
+    if isinstance(r, tuple):
+        return r
+    return r, None
 
 
 def _resolve_agent_backend(provider_id, model):
@@ -1115,23 +1109,30 @@ def _agent_events(messages, model, provider_id, max_steps, temperature, top_p, t
             asst = {"role": "assistant", "content": "", "tool_calls": calls}
             msgs.append(asst)
             new_msgs.append(asst)
+            prepared = []
             for tc in calls:
                 fn = tc.get("function") or {}
                 name = fn.get("name") or ""
                 args = _t_parse_args(fn.get("arguments"))
+                prepared.append((tc, name, args))
                 yield {"type": "tool_call", "id": tc.get("id"), "name": name,
-                       "summary": _tool_summary(name, args)}
-                content = _exec_tool(name, args)
-                tev = {"type": "tool_result", "id": tc.get("id"), "name": name,
-                       "ok": not str(content).startswith("（"), "content": str(content)[:2000]}
-                if name == "web_search":
-                    tev["cards"] = _search_cards(args)
-                if name == "generate_image" and str(content).startswith("[已生成图片] "):
-                    tev["image"] = str(content)[len("[已生成图片] "):].strip()
-                yield tev
-                tmsg = {"role": "tool", "tool_call_id": tc.get("id"), "content": content}
-                msgs.append(tmsg)
-                new_msgs.append(tmsg)
+                       "step": step, "summary": _tool_summary(name, args)}
+            with ThreadPoolExecutor(max_workers=min(8, max(1, len(prepared)))) as ex:
+                futs = {ex.submit(_exec_tool, name, args): (tc, name, args) for tc, name, args in prepared}
+                for fut in as_completed(futs):
+                    tc, name, args = futs[fut]
+                    content, meta = fut.result()
+                    tev = {"type": "tool_result", "id": tc.get("id"), "name": name,
+                           "step": step, "ok": not str(content).startswith("（"),
+                           "content": str(content)[:2000]}
+                    if meta and meta.get("cards"):
+                        tev["cards"] = meta["cards"]
+                    if meta and meta.get("image"):
+                        tev["image"] = meta["image"]
+                    yield tev
+                    tmsg = {"role": "tool", "tool_call_id": tc.get("id"), "content": content}
+                    msgs.append(tmsg)
+                    new_msgs.append(tmsg)
         if not answered:
             yield {"type": "status", "phase": "answering"}
             t0 = time.time()
