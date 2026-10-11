@@ -13,6 +13,7 @@ import math
 import operator
 import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -1420,8 +1421,8 @@ def _agent_model_call(url, key, model, messages, tools, is_qwen, external, tempe
         raise RuntimeError("HTTP %s: %s" % (exc.code, body[:400]))
     choices = data.get("choices") or []
     if not choices:
-        return None
-    return choices[0].get("message") or None
+        return None, {}
+    return choices[0].get("message") or None, (data.get("usage") or {})
 
 
 def _agent_events(messages, model, provider_id, max_steps, temperature, top_p):
@@ -1431,11 +1432,14 @@ def _agent_events(messages, model, provider_id, max_steps, temperature, top_p):
         return
     msgs = [dict(m) for m in messages]
     answered = False
+    usage = {}
+    gen_ms = 0
     try:
         for step in range(max(1, max_steps)):
             yield {"type": "status", "phase": "deciding", "step": step}
+            t0 = time.time()
             try:
-                msg = _agent_model_call(url, key, model, msgs, TOOL_SCHEMAS, is_qwen, external, temperature, top_p)
+                msg, u = _agent_model_call(url, key, model, msgs, TOOL_SCHEMAS, is_qwen, external, temperature, top_p)
             except Exception as exc:
                 yield {"type": "error", "message": "upstream_error: %s" % str(exc)[:160]}
                 return
@@ -1448,6 +1452,8 @@ def _agent_events(messages, model, provider_id, max_steps, temperature, top_p):
                 for i in range(0, len(text), 24):
                     yield {"type": "answer_delta", "text": text[i:i + 24]}
                 answered = True
+                usage = u or {}
+                gen_ms = int((time.time() - t0) * 1000)
                 break
             asst = {"role": "assistant", "content": "", "tool_calls": tcs}
             rc = msg.get("reasoning_content")
@@ -1469,17 +1475,20 @@ def _agent_events(messages, model, provider_id, max_steps, temperature, top_p):
                 msgs.append({"role": "tool", "tool_call_id": tc.get("id"), "content": content})
         if not answered:
             yield {"type": "status", "phase": "answering"}
+            t0 = time.time()
             try:
-                msg = _agent_model_call(url, key, model, msgs, None, is_qwen, external, temperature, top_p)
+                msg, u = _agent_model_call(url, key, model, msgs, None, is_qwen, external, temperature, top_p)
                 text = (msg or {}).get("content") or ""
+                usage = u or {}
             except Exception:
                 text = ""
+            gen_ms = int((time.time() - t0) * 1000)
             for i in range(0, len(text), 24):
                 yield {"type": "answer_delta", "text": text[i:i + 24]}
     except Exception as exc:
         yield {"type": "error", "message": str(exc)[:200]}
         return
-    yield {"type": "done", "model": model}
+    yield {"type": "done", "model": model, "usage": usage, "gen_ms": gen_ms}
 
 
 @router.post("/agent")
