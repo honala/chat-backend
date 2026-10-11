@@ -941,8 +941,56 @@ def _t_generate_image(args):
 
 
 _TOOL_SCHEMA_IMAGE = {"type": "function", "function": {"name": "generate_image", "description": "根据文字描述生成图片。当用户要求画图、生成图片、配图时使用。", "parameters": {"type": "object", "properties": {"prompt": {"type": "string", "description": "图片的详细描述"}, "size": {"type": "string", "description": "尺寸如 1024*1024（可选）"}}, "required": ["prompt"]}}}
-TOOL_SCHEMAS = [_TOOL_SCHEMA_SEARCH, _TOOL_SCHEMA_READ, _TOOL_SCHEMA_WEATHER, _TOOL_SCHEMA_TIME, _TOOL_SCHEMA_CALC, _TOOL_SCHEMA_IMAGE]
-_TOOL_FUNCS = {"web_search": _t_web_search, "read_url": _t_read_url, "weather": _t_weather, "get_time": _t_get_time, "calculator": _t_calculator, "generate_image": _t_generate_image}
+def _t_generate_video(args):
+    prompt = str(args.get("prompt") or "").strip()[:1000]
+    if not prompt:
+        return "（未提供视频描述）"
+    api_key = _get_api_key("dashscope")
+    if not api_key:
+        return "（视频生成未配置 dashscope key）"
+    try:
+        duration = int(args.get("duration") or 5)
+    except Exception:
+        duration = 5
+    req_body = {"model": "happyhorse-1.0-i2v", "input": {"prompt": prompt}, "parameters": {"duration": duration}}
+    req = urllib.request.Request(
+        DASHSCOPE_VIDEO_URL, data=json.dumps(req_body, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Authorization": "***" % api_key,
+                 "X-DashScope-Async": "enable"},
+        method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as upstream:
+            data = json.loads(upstream.read().decode("utf-8"))
+        task_id = data.get("output", {}).get("task_id", "")
+    except Exception as exc:
+        return "（视频生成失败：%s）" % str(exc)[:120]
+    if not task_id:
+        return "（视频生成未返回任务号）"
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        time.sleep(4)
+        try:
+            r = urllib.request.Request(
+                "https://dashscope.aliyuncs.com/api/v1/tasks/%s" % task_id,
+                headers={"Authorization": "***" % api_key})
+            with urllib.request.urlopen(r, timeout=15) as up:
+                st = json.loads(up.read().decode("utf-8"))
+        except Exception:
+            continue
+        stt = st.get("output", {}).get("task_status", "")
+        if stt == "SUCCEEDED":
+            vurl = st.get("output", {}).get("video_url", "")
+            if vurl:
+                return "[已生成视频] %s" % vurl, {"video": vurl}
+            return "（视频生成成功但无地址）"
+        if stt in ("FAILED", "CANCELED"):
+            return "（视频生成失败：%s）" % stt
+    return "（视频生成超时，任务号 %s，可稍后重试）" % task_id
+
+
+_TOOL_SCHEMA_VIDEO = {"type": "function", "function": {"name": "generate_video", "description": "根据文字描述生成短视频。当用户要求生成视频、动画、动态效果时使用。", "parameters": {"type": "object", "properties": {"prompt": {"type": "string", "description": "视频的详细描述"}, "duration": {"type": "integer", "description": "时长（秒，默认5）"}}, "required": ["prompt"]}}}
+TOOL_SCHEMAS = [_TOOL_SCHEMA_SEARCH, _TOOL_SCHEMA_READ, _TOOL_SCHEMA_WEATHER, _TOOL_SCHEMA_TIME, _TOOL_SCHEMA_CALC, _TOOL_SCHEMA_IMAGE, _TOOL_SCHEMA_VIDEO]
+_TOOL_FUNCS = {"web_search": _t_web_search, "read_url": _t_read_url, "weather": _t_weather, "get_time": _t_get_time, "calculator": _t_calculator, "generate_image": _t_generate_image, "generate_video": _t_generate_video}
 
 
 def _tool_summary(name, args):
@@ -958,6 +1006,8 @@ def _tool_summary(name, args):
         return "计算：" + str(args.get("expression", ""))
     if name == "generate_image":
         return "生成图片：" + str(args.get("prompt", ""))[:40]
+    if name == "generate_video":
+        return "生成视频：" + str(args.get("prompt", ""))[:40]
     return name
 
 
