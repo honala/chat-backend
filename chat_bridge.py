@@ -1398,97 +1398,161 @@ def _resolve_agent_backend(provider_id, model):
     return api_url, key, is_qwen, False
 
 
-def _agent_model_call(url, key, model, messages, tools, is_qwen, external, temperature, top_p):
-    body = {"model": model, "messages": messages, "stream": False,
+def _agent_sanitize(messages):
+    """剥离历史里的 reasoning_content，避免上游 400（DeepSeek 规定输入不得含它）。"""
+    out = []
+    for m in messages:
+        if isinstance(m, dict) and "reasoning_content" in m:
+            m = {k: v for k, v in m.items() if k != "reasoning_content"}
+        out.append(m)
+    return out
+
+
+def _agent_stream_call(url, key, model, messages, tools, is_qwen, external, temperature, top_p, think=False):
+    """流式请求上游，逐块 yield：{"content"/"reasoning"/"tool_calls_delta"/"usage"/"finish_reason"}"""
+    body = {"model": model, "messages": messages, "stream": True,
             "temperature": temperature, "top_p": top_p}
     if tools:
         body["tools"] = tools
         body["tool_choice"] = "auto"
     if not external:
         if is_qwen:
-            body["enable_thinking"] = False
-        else:
+            body["enable_thinking"] = bool(think)
+        elif not think:
             body["thinking"] = {"type": "disabled"}
     req = urllib.request.Request(
         url, data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Accept": "application/json",
+        headers={"Content-Type": "application/json", "Accept": "text/event-stream",
                  "Authorization": "Bearer %s" % key}, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        resp = urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT)
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError("HTTP %s: %s" % (exc.code, body[:400]))
-    choices = data.get("choices") or []
-    if not choices:
-        return None, {}
-    return choices[0].get("message") or None, (data.get("usage") or {})
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError("HTTP %s: %s" % (exc.code, detail[:300]))
+    try:
+        for raw in resp:
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line or line.startswith(":") or not line.startswith("data:"):
+                continue
+            ds = line[5:].strip()
+            if ds == "[DONE]":
+                break
+            try:
+                obj = json.loads(ds)
+            except Exception:
+                continue
+            u = obj.get("usage")
+            if u:
+                yield {"usage": u}
+            choices = obj.get("choices") or []
+            if not choices:
+                continue
+            ch = choices[0]
+            fr = ch.get("finish_reason")
+            if fr:
+                yield {"finish_reason": fr}
+            delta = ch.get("delta") or {}
+            if delta.get("reasoning_content"):
+                yield {"reasoning": delta["reasoning_content"]}
+            if delta.get("content"):
+                yield {"content": delta["content"]}
+            if delta.get("tool_calls"):
+                yield {"tool_calls_delta": delta["tool_calls"]}
+    finally:
+        resp.close()
 
 
-def _agent_events(messages, model, provider_id, max_steps, temperature, top_p):
+def _merge_tool_deltas(acc, deltas):
+    for d in deltas:
+        idx = d.get("index", 0)
+        tc = acc.setdefault(idx, {"id": None, "type": "function",
+                                  "function": {"name": "", "arguments": ""}})
+        if d.get("id"):
+            tc["id"] = d["id"]
+        if d.get("type"):
+            tc["type"] = d["type"]
+        fn = d.get("function") or {}
+        if fn.get("name"):
+            tc["function"]["name"] += fn["name"]
+        if fn.get("arguments"):
+            tc["function"]["arguments"] += fn["arguments"]
+
+
+def _agent_events(messages, model, provider_id, max_steps, temperature, top_p, think=False):
     url, key, is_qwen, external = _resolve_agent_backend(provider_id, model)
     if not key:
         yield {"type": "error", "message": "api_key_not_configured"}
         return
-    msgs = [dict(m) for m in messages]
-    answered = False
+    msgs = _agent_sanitize([dict(m) for m in messages])
+    new_msgs = []
     usage = {}
+    finish_reason = ""
     gen_ms = 0
+    answered = False
     try:
         for step in range(max(1, max_steps)):
             yield {"type": "status", "phase": "deciding", "step": step}
+            acc = {}
             t0 = time.time()
             try:
-                msg, u = _agent_model_call(url, key, model, msgs, TOOL_SCHEMAS, is_qwen, external, temperature, top_p)
+                for ev in _agent_stream_call(url, key, model, msgs, TOOL_SCHEMAS, is_qwen, external, temperature, top_p, think):
+                    if "usage" in ev:
+                        usage = ev["usage"]
+                    if "finish_reason" in ev:
+                        finish_reason = ev["finish_reason"]
+                    if "reasoning" in ev and think:
+                        yield {"type": "thinking", "text": ev["reasoning"]}
+                    if "content" in ev:
+                        yield {"type": "answer_delta", "text": ev["content"]}
+                    if "tool_calls_delta" in ev:
+                        _merge_tool_deltas(acc, ev["tool_calls_delta"])
             except Exception as exc:
-                yield {"type": "error", "message": "upstream_error: %s" % str(exc)[:160]}
+                yield {"type": "error", "message": "upstream_error: %s" % str(exc)[:200]}
                 return
-            if msg is None:
-                yield {"type": "error", "message": "upstream_empty"}
-                return
-            tcs = msg.get("tool_calls") or []
-            if not tcs:
-                text = msg.get("content") or ""
-                for i in range(0, len(text), 24):
-                    yield {"type": "answer_delta", "text": text[i:i + 24]}
+            if not acc:
                 answered = True
-                usage = u or {}
                 gen_ms = int((time.time() - t0) * 1000)
                 break
-            asst = {"role": "assistant", "content": "", "tool_calls": tcs}
-            rc = msg.get("reasoning_content")
-            if rc:
-                asst["reasoning_content"] = rc
+            calls = [acc[i] for i in sorted(acc.keys())]
+            asst = {"role": "assistant", "content": "", "tool_calls": calls}
             msgs.append(asst)
-            for tc in tcs:
+            new_msgs.append(asst)
+            for tc in calls:
                 fn = tc.get("function") or {}
                 name = fn.get("name") or ""
                 args = _t_parse_args(fn.get("arguments"))
                 yield {"type": "tool_call", "id": tc.get("id"), "name": name,
                        "summary": _tool_summary(name, args)}
                 content = _exec_tool(name, args)
-                ev = {"type": "tool_result", "id": tc.get("id"), "name": name,
-                      "ok": not str(content).startswith("（"), "content": str(content)[:2000]}
+                tev = {"type": "tool_result", "id": tc.get("id"), "name": name,
+                       "ok": not str(content).startswith("（"), "content": str(content)[:2000]}
                 if name == "web_search":
-                    ev["cards"] = _search_cards(args)
-                yield ev
-                msgs.append({"role": "tool", "tool_call_id": tc.get("id"), "content": content})
+                    tev["cards"] = _search_cards(args)
+                yield tev
+                tmsg = {"role": "tool", "tool_call_id": tc.get("id"), "content": content}
+                msgs.append(tmsg)
+                new_msgs.append(tmsg)
         if not answered:
             yield {"type": "status", "phase": "answering"}
             t0 = time.time()
             try:
-                msg, u = _agent_model_call(url, key, model, msgs, None, is_qwen, external, temperature, top_p)
-                text = (msg or {}).get("content") or ""
-                usage = u or {}
+                for ev in _agent_stream_call(url, key, model, msgs, None, is_qwen, external, temperature, top_p, think):
+                    if "usage" in ev:
+                        usage = ev["usage"]
+                    if "finish_reason" in ev:
+                        finish_reason = ev["finish_reason"]
+                    if "reasoning" in ev and think:
+                        yield {"type": "thinking", "text": ev["reasoning"]}
+                    if "content" in ev:
+                        yield {"type": "answer_delta", "text": ev["content"]}
             except Exception:
-                text = ""
+                pass
             gen_ms = int((time.time() - t0) * 1000)
-            for i in range(0, len(text), 24):
-                yield {"type": "answer_delta", "text": text[i:i + 24]}
     except Exception as exc:
         yield {"type": "error", "message": str(exc)[:200]}
         return
-    yield {"type": "done", "model": model, "usage": usage, "gen_ms": gen_ms}
+    yield {"type": "done", "model": model, "usage": usage, "gen_ms": gen_ms,
+           "finish_reason": finish_reason, "new_messages": new_msgs}
 
 
 @router.post("/agent")
@@ -1508,9 +1572,10 @@ async def agent_endpoint(request: Request):
     max_steps = int(body.get("max_steps") or 4)
     temperature = float(body.get("temperature", 0.7))
     top_p = float(body.get("top_p", 0.9))
+    think = bool(body.get("think", False))
 
     def generate():
-        for ev in _agent_events(messages, model, provider_id, max_steps, temperature, top_p):
+        for ev in _agent_events(messages, model, provider_id, max_steps, temperature, top_p, think):
             yield (json.dumps(ev, ensure_ascii=False) + "\n").encode("utf-8")
 
     return StreamingResponse(generate(), media_type="application/x-ndjson")
