@@ -1,4 +1,4 @@
-import json
+﻿import json
 import os
 import re
 from datetime import datetime, timezone
@@ -447,4 +447,3 @@ async def thumb_refresh(token: str = Form(...), filename: str = Form(...)):
             pass
 
     return {"ok": True, "file": name}
-

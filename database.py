@@ -1,4 +1,4 @@
-"""SQLite persistence for chat sessions, messages, and uploaded file metadata."""
+﻿"""SQLite persistence for chat sessions, messages, and uploaded file metadata."""
 import json
 import os
 import sqlite3

@@ -1,4 +1,4 @@
-# ADR-001 (2026-05-19): 图片上传"URL 方案"已废弃，回退纯 base64
+﻿# ADR-001 (2026-05-19): 图片上传"URL 方案"已废弃，回退纯 base64
 # 三个失败节点：
 #   1. Cloudflare Tunnel 路由 — 境外 edge 节点无法回源到新增 /api/chat-upload，
 #      国内正常，路径注册问题
@@ -523,7 +523,7 @@ async def free_llm(request: Request):
     if not isinstance(payload_value, dict):
         return JSONResponse({"error": "invalid_payload"}, status_code=400)
 
-    model = str(payload_value.get("model") or "deepseek-v4-flash")
+    model = str(payload_value.get("model") or "deepseek-flash")
     api_url, api_key, is_qwen = _get_backend(model)
     if not api_key:
         return JSONResponse({"error": "api_key_not_configured", "detail": f"服务器未配置 {model} 的 API 密钥"}, status_code=503)
@@ -922,7 +922,7 @@ async def free_llm_tool(request: Request):
     if not isinstance(payload_value, dict):
         return JSONResponse({"error": "invalid_payload"}, status_code=400)
 
-    model = str(payload_value.get("model") or "deepseek-v4-flash")
+    model = str(payload_value.get("model") or "deepseek-flash")
     api_url, api_key, is_qwen = _get_backend(model)
     if not api_key:
         return JSONResponse({"error": "api_key_not_configured", "detail": f"服务器未配置 {model} 的 API 密钥"}, status_code=503)
