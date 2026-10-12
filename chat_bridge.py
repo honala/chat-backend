@@ -1088,9 +1088,9 @@ def _agent_stream_call(url, key, model, messages, tools, is_qwen, external, temp
         if is_qwen:
             body["enable_thinking"] = bool(think)
             if think:
-                body["thinking_budget"] = {"low": 1024, "medium": 4096, "high": 16384}.get(effort, 4096)
+                body["thinking_budget"] = {"low": 1024, "high": 4096, "max": 16384}.get(effort, 4096)
         elif think:
-            body["reasoning_effort"] = effort if effort in ("low", "medium", "high") else "medium"
+            body["reasoning_effort"] = effort if effort in ("low", "high", "max") else "high"
         else:
             body["thinking"] = {"type": "disabled"}
     req = urllib.request.Request(
@@ -1295,9 +1295,11 @@ async def agent_endpoint(request: Request):
     temperature = float(body.get("temperature", 0.7))
     top_p = float(body.get("top_p", 0.9))
     think = bool(body.get("think", False))
-    effort = str(body.get("effort") or "medium").strip().lower()
-    if effort not in ("low", "medium", "high"):
-        effort = "medium"
+    effort = str(body.get("effort") or "high").strip().lower()
+    if effort == "medium":
+        effort = "high"
+    if effort not in ("low", "high", "max"):
+        effort = "high"
     agent_id = request.headers.get("x-agent-id") or ""
 
     def generate():
