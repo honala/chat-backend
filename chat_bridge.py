@@ -1077,7 +1077,7 @@ def _agent_sanitize(messages):
     return out
 
 
-def _agent_stream_call(url, key, model, messages, tools, is_qwen, external, temperature, top_p, think=False):
+def _agent_stream_call(url, key, model, messages, tools, is_qwen, external, temperature, top_p, think=False, effort="medium"):
     """流式请求上游，逐块 yield：{"content"/"reasoning"/"tool_calls_delta"/"usage"/"finish_reason"}"""
     body = {"model": model, "messages": messages, "stream": True,
             "temperature": temperature, "top_p": top_p}
@@ -1087,7 +1087,11 @@ def _agent_stream_call(url, key, model, messages, tools, is_qwen, external, temp
     if not external:
         if is_qwen:
             body["enable_thinking"] = bool(think)
-        elif not think:
+            if think:
+                body["thinking_budget"] = {"low": 1024, "medium": 4096, "high": 16384}.get(effort, 4096)
+        elif think:
+            body["reasoning_effort"] = effort if effort in ("low", "medium", "high") else "medium"
+        else:
             body["thinking"] = {"type": "disabled"}
     req = urllib.request.Request(
         url, data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
@@ -1147,7 +1151,7 @@ def _merge_tool_deltas(acc, deltas):
             tc["function"]["arguments"] += fn["arguments"]
 
 
-def _agent_events(messages, model, provider_id, max_steps, temperature, top_p, think=False, agent_id=""):
+def _agent_events(messages, model, provider_id, max_steps, temperature, top_p, think=False, agent_id="", effort="medium"):
     url, key, is_qwen, external = _resolve_agent_backend(provider_id, model)
     if not key:
         yield {"type": "error", "message": "api_key_not_configured"}
@@ -1168,7 +1172,7 @@ def _agent_events(messages, model, provider_id, max_steps, temperature, top_p, t
             acc = {}
             t0 = time.time()
             try:
-                for ev in _agent_stream_call(url, key, model, msgs, TOOL_SCHEMAS, is_qwen, external, temperature, top_p, think):
+                for ev in _agent_stream_call(url, key, model, msgs, TOOL_SCHEMAS, is_qwen, external, temperature, top_p, think, effort):
                     if "usage" in ev:
                         usage = ev["usage"]
                     if "finish_reason" in ev:
@@ -1238,7 +1242,7 @@ def _agent_events(messages, model, provider_id, max_steps, temperature, top_p, t
             yield {"type": "status", "phase": "answering"}
             t0 = time.time()
             try:
-                for ev in _agent_stream_call(url, key, model, msgs, None, is_qwen, external, temperature, top_p, think):
+                for ev in _agent_stream_call(url, key, model, msgs, None, is_qwen, external, temperature, top_p, think, effort):
                     if "usage" in ev:
                         usage = ev["usage"]
                     if "finish_reason" in ev:
@@ -1291,11 +1295,14 @@ async def agent_endpoint(request: Request):
     temperature = float(body.get("temperature", 0.7))
     top_p = float(body.get("top_p", 0.9))
     think = bool(body.get("think", False))
+    effort = str(body.get("effort") or "medium").strip().lower()
+    if effort not in ("low", "medium", "high"):
+        effort = "medium"
     agent_id = request.headers.get("x-agent-id") or ""
 
     def generate():
         try:
-            for ev in _agent_events(messages, model, provider_id, max_steps, temperature, top_p, think, agent_id):
+            for ev in _agent_events(messages, model, provider_id, max_steps, temperature, top_p, think, agent_id, effort):
                 yield (json.dumps(ev, ensure_ascii=False) + "\n").encode("utf-8")
         finally:
             if agent_id:
