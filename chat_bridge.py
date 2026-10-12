@@ -12,6 +12,7 @@ import ipaddress
 import json
 import math
 import socket
+import threading
 import operator
 import os
 import re
@@ -1262,6 +1263,88 @@ def _agent_events(messages, model, provider_id, max_steps, temperature, top_p, t
 
 
 _AGENT_STOP = {}
+_AGENT_RUNS = {}
+_AGENT_RUNS_LOCK = threading.Lock()
+_AGENT_RUN_TTL = 900  # 完成后保留多久(秒)供断线续传
+
+
+class _AgentRun:
+    __slots__ = ("id", "events", "done", "cond", "created", "finished", "thread")
+
+    def __init__(self, agent_id):
+        self.id = agent_id
+        self.events = []
+        self.done = False
+        self.cond = threading.Condition()
+        self.created = time.time()
+        self.finished = None
+        self.thread = None
+
+    def push(self, ev):
+        with self.cond:
+            e = dict(ev)
+            e["seq"] = len(self.events)
+            self.events.append(e)
+            if e.get("type") in ("done", "error"):
+                self.done = True
+                self.finished = time.time()
+            self.cond.notify_all()
+
+    def close(self):
+        with self.cond:
+            self.done = True
+            if self.finished is None:
+                self.finished = time.time()
+            self.cond.notify_all()
+
+
+def _prune_agent_runs():
+    now = time.time()
+    with _AGENT_RUNS_LOCK:
+        for k in list(_AGENT_RUNS.keys()):
+            r = _AGENT_RUNS[k]
+            with r.cond:
+                done = r.done
+                fin = r.finished or r.created
+            if done and (now - fin) > _AGENT_RUN_TTL:
+                _AGENT_RUNS.pop(k, None)
+
+
+def _run_agent_thread(run, messages, model, provider_id, max_steps, temperature, top_p, think, effort):
+    """后台线程跑 Agent 循环；客户端断连不影响它继续，事件缓冲到 run.events。"""
+    try:
+        for ev in _agent_events(messages, model, provider_id, max_steps, temperature, top_p, think, run.id, effort):
+            run.push(ev)
+            if ev.get("type") in ("done", "error"):
+                break
+    except Exception as exc:
+        run.push({"type": "error", "message": str(exc)[:200]})
+    finally:
+        run.close()
+        _AGENT_STOP.pop(run.id, None)
+
+
+def _follow_agent_run(run, from_seq):
+    """按 seq 从缓冲续传；空闲时发 ping 保活。支持多个追随者同时读。"""
+    idx = max(0, int(from_seq or 0))
+    while True:
+        batch = []
+        with run.cond:
+            if idx < len(run.events):
+                batch = run.events[idx:]
+                idx = len(run.events)
+            elif not run.done:
+                run.cond.wait(timeout=10)
+                if idx < len(run.events):
+                    batch = run.events[idx:]
+                    idx = len(run.events)
+        if batch:
+            for ev in batch:
+                yield ev
+            continue
+        if run.done:
+            break
+        yield {"type": "ping", "seq": idx}
 
 
 @router.post("/agent/abort")
@@ -1279,38 +1362,64 @@ async def agent_abort(request: Request):
 
 @router.post("/agent")
 async def agent_endpoint(request: Request):
-    """Server-side agent loop: decides, executes tools, streams events as NDJSON."""
+    """服务端 Agent：生成在后台线程运行；可断线重连续传（X-Agent-Id + ?from=seq）。"""
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse({"error": "invalid_json"}, status_code=400)
+        body = {}
     if not isinstance(body, dict):
-        return JSONResponse({"error": "invalid_payload"}, status_code=400)
-    messages = body.get("messages")
-    if not isinstance(messages, list) or not messages:
-        return JSONResponse({"error": "invalid_messages"}, status_code=400)
-    model = str(body.get("model") or "deepseek-flash")
-    provider_id = str(body.get("provider_id") or "") or None
-    max_steps = int(body.get("max_steps") or 4)
-    temperature = float(body.get("temperature", 0.7))
-    top_p = float(body.get("top_p", 0.9))
-    think = bool(body.get("think", False))
-    effort = str(body.get("effort") or "high").strip().lower()
-    if effort == "medium":
-        effort = "high"
-    if effort not in ("low", "high", "max"):
-        effort = "high"
-    agent_id = request.headers.get("x-agent-id") or ""
+        body = {}
+
+    agent_id = (request.headers.get("x-agent-id") or "").strip()
+    try:
+        from_seq = int(request.query_params.get("from") or 0)
+    except Exception:
+        from_seq = 0
+
+    _prune_agent_runs()
+
+    run = None
+    if agent_id:
+        with _AGENT_RUNS_LOCK:
+            run = _AGENT_RUNS.get(agent_id)
+
+    if run is None:
+        messages = body.get("messages")
+        if not isinstance(messages, list) or not messages:
+            return JSONResponse({"error": "invalid_messages"}, status_code=400)
+        model = str(body.get("model") or "deepseek-flash")
+        provider_id = str(body.get("provider_id") or "") or None
+        max_steps = int(body.get("max_steps") or 4)
+        temperature = float(body.get("temperature", 0.7))
+        top_p = float(body.get("top_p", 0.9))
+        think = bool(body.get("think", False))
+        effort = str(body.get("effort") or "high").strip().lower()
+        if effort == "medium":
+            effort = "high"
+        if effort not in ("low", "high", "max"):
+            effort = "high"
+        if not agent_id:
+            agent_id = "run-" + uuid.uuid4().hex[:12]
+        run = _AgentRun(agent_id)
+        with _AGENT_RUNS_LOCK:
+            _AGENT_RUNS[agent_id] = run
+        th = threading.Thread(
+            target=_run_agent_thread,
+            args=(run, messages, model, provider_id, max_steps, temperature, top_p, think, effort),
+            daemon=True,
+        )
+        run.thread = th
+        th.start()
+        from_seq = 0
 
     def generate():
-        try:
-            for ev in _agent_events(messages, model, provider_id, max_steps, temperature, top_p, think, agent_id, effort):
-                yield (json.dumps(ev, ensure_ascii=False) + "\n").encode("utf-8")
-        finally:
-            if agent_id:
-                _AGENT_STOP.pop(agent_id, None)
+        for ev in _follow_agent_run(run, from_seq):
+            yield (json.dumps(ev, ensure_ascii=False) + "\n").encode("utf-8")
 
-    return StreamingResponse(generate(), media_type="application/x-ndjson")
+    resp = StreamingResponse(generate(), media_type="application/x-ndjson")
+    resp.headers["X-Agent-Run-Id"] = run.id
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
 
 
 @router.post("/image-gen")
